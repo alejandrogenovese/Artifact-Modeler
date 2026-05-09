@@ -1,0 +1,37 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Conectá el repo a Render y elegí "New > Blueprint" para aplicar este archivo.
+services:
+  - type: web
+    runtime: static
+    name: idp-artifact-modeler
+    # Si no necesitás compilar nada, dejá buildCommand vacío.
+    buildCommand: ""
+    staticPublishPath: ./public
+    pullRequestPreviewsEnabled: true
+
+    # Headers — caché agresivo para assets, sin caché para el HTML
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: SAMEORIGIN
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+      - path: /*.css
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /*.js
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      - path: /*.jsx
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+
+    # SPA fallback — si en algún momento agregás routing client-side
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
