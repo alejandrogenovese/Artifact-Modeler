@@ -1,21 +1,53 @@
 # IDP Artifact Modeler
 
-App estática React (Bronze/Silver/Gold modeler) para deploy en **Render Static Site**.
+App estática React (Bronze/Silver/Gold modeler + generador dbt) para deploy en **Render Static Site**.
 
-## Arquitectura
+Genera artefactos dbt (`_sources.yml`, `_models.yml`, `.sql`) que respetan la _Nomenclatura de Objetos – Data Mesh_ (Banco Galicia).
 
-- **Sin build step.** React 18 cargado vía CDN UMD, JSX transpilado en el browser con `@babel/standalone`.
-- **Estado:** todo en `localStorage` bajo la key `artifact_modeler_v2`. No hay backend.
+## Qué incluye esta versión
+
+- **Panel "Identidad del Data Product"** colapsable — captura `data_product`, `sigla_aplicativa`, `logical_name`, tipo de Gold (dim/fact), uso fact (snap/trx/agr) y frecuencia. Muestra en vivo los nombres calculados (`stg_<sigla>_<logical>`, `<dp>_inter_<logical>`, etc.).
+- **Linter de sufijos** según el Anexo del documento de Nomenclatura. Cualquier `target_name` que no termine en uno de `_id _cd _fc _fl _hr _nu _pc _pr _rt _sc _ts _tx _vl` queda marcado, y si termina en uno pero el `target_type` no matchea (ej. `nacimiento_fc` con `VARCHAR`), se marca como error.
+- **Tests automáticos por sufijo** — el generador inyecta tests dbt según el sufijo del campo:
+  - `_id`: `not_null + unique`
+  - `_pc`, `_pr`: `dbt_utils.expression_is_true: '>= 0 and <= 1'`
+  - `is_key=true`: `not_null + unique`
+  - `nullable=false`: `not_null`
+  - `val_codigo_valido` con valores: `accepted_values`
+- **Preview con tabs dbt** — ves en vivo `bronze _sources.yml`, `silver _models.yml`, `silver .sql`, `gold _models.yml`, `gold .sql` mientras editás.
+- **Export ZIP completo** — botón **📦 ZIP dbt** en topbar. Descarga la estructura `models/{bronze,silver,gold}/` lista para mergear contra un proyecto dbt existente, más README contextual y backup del state del modeler.
+- **Auto-inyección de campos de auditoría** — `audit_created_ts_local` (Bronze), `audit_created_ts` + `audit_data_source_tx` (Silver/Gold). Los timestamps usan `convert_timezone('America/Argentina/Buenos_Aires', getdate())` según el documento.
+- **Surrogate key automática en Gold** — cuando hay PK compuesta (más de un `is_key`), se genera la columna `<concept1>_<concept2>_id` con `md5(coalesce(...) || '-' || coalesce(...))::varchar(100)`.
+
+## Arquitectura técnica
+
+- **Sin build step.** React 18 + JSZip vía CDN, JSX transpilado en el browser con `@babel/standalone`.
+- **Estado:** `localStorage` bajo `artifact_modeler_v2`. Migración automática para projects guardados sin `meta` (parsea schemas viejos para deducir `sigla`, `data_product`, `logical_name`).
 - **Estructura:**
   ```
   public/
-  ├── index.html       ← entry point
-  ├── app.jsx          ← componente principal (multi-stage)
-  ├── helpers.js       ← utilidades (sufijos, sugerencias de tipo, etc.)
-  ├── seed.js          ← datos seed para los 3 stages
+  ├── index.html             ← entry point
+  ├── app.jsx                ← componente principal multi-stage
+  ├── helpers.js             ← utilidades existentes (positions, suggest, toYaml)
+  ├── seed.js                ← datos seed para los 3 stages
+  ├── dbt-generator.js       ← (NUEVO) name builders + suffix rules + linter + YAML/SQL/ZIP
   ├── styles.css
   └── favicon.svg
   ```
+
+## Convención implementada (resumen)
+
+Todos los nombres se derivan automáticamente del panel de metadata del DP:
+
+| Capa | Schema | Tabla |
+|---|---|---|
+| Bronze | `stg_<sigla>_<logical>` | `<interface_name>` (tal cual del origen) |
+| Silver | `<dp>_inter_<logical>` | `<silver_table_name>` |
+| Gold (dim) | `<dp>_mart_<logical>` | `dim_<content>` |
+| Gold (fact trx) | `<dp>_mart_<logical>` | `fact_trx_<content>` |
+| Gold (fact snap) | `<dp>_mart_<logical>` | `fact_snap_<content>_<freq>` |
+| Gold (fact agr) | `<dp>_mart_<logical>` | `fact_agr_<content>_<freq>` |
+| Gold views | `<dp>_martviews_<logical>` | `vw_<...>` |
 
 ## Deploy en Render
 
@@ -24,15 +56,12 @@ App estática React (Bronze/Silver/Gold modeler) para deploy en **Render Static 
 1. Pushear este repo a GitHub/GitLab.
 2. En Render: **New → Blueprint** y apuntar al repo.
 3. Render detecta `render.yaml` y crea el Static Site automáticamente.
-4. Listo. Render asigna `https://idp-artifact-modeler.onrender.com` (o el nombre que pongas).
 
-### Opción B — Configuración manual
+### Opción B — Manual
 
-1. **New → Static Site** en el dashboard de Render.
+1. **New → Static Site** en Render dashboard.
 2. Conectar el repo.
-3. Configuración:
-   - **Build Command:** *(dejar vacío)*
-   - **Publish Directory:** `public`
+3. **Build Command:** *(vacío)* · **Publish Directory:** `public`
 4. Deploy.
 
 ## Dev local
@@ -40,43 +69,14 @@ App estática React (Bronze/Silver/Gold modeler) para deploy en **Render Static 
 No hace falta `npm install`. Cualquier server estático sirve:
 
 ```bash
-# Python
 cd public && python3 -m http.server 8080
-
-# Node
+# o
 npx serve public
-
-# o con caddy
-caddy file-server --root public --listen :8080
 ```
 
 Abrir `http://localhost:8080`.
 
-## Consideraciones
+## Próximos pasos planeados
 
-### Performance del Babel en browser
-
-`@babel/standalone` pesa ~3MB y transpila el JSX en cada carga. Para una herramienta interna está bien, pero si en algún momento querés mejorarlo:
-
-1. Instalar Vite: `npm create vite@latest . -- --template react`
-2. Mover `app.jsx` a `src/`, importar `helpers.js` y `seed.js` como módulos.
-3. Cambiar `render.yaml`:
-   ```yaml
-   buildCommand: npm ci && npm run build
-   staticPublishPath: ./dist
-   ```
-
-Eso baja el bundle a ~150KB y elimina el round-trip del CDN.
-
-### Estado en localStorage
-
-Al estar todo en `localStorage`, **el estado vive en cada browser**. Si querés compartir modelos entre el equipo, va a hacer falta un backend (FastAPI BFF + Postgres encajaría bien con tu Arch Manager pattern).
-
-### Edit mode de Claude Design
-
-El archivo original `tweaks-panel.jsx` es infraestructura del editor de Claude Design (escucha postMessages `__activate_edit_mode`, etc.). En producción no se usa — lo descarté del bundle.
-
-## Auth
-
-El código menciona `AUTH_KEY = "artifact_modeler_auth_v1"` en `localStorage`. Si tenés un flow de auth client-side ya implementado, funciona tal cual. Si querés meter SSO de Galicia, tendrías que ir contra un BFF.
-# Artifact-Modeler
+- (4) Backend Supabase + auth + versionado (cuando lo de generación esté validado en uso real).
+- (5) Edge Function que regenera el ZIP en Storage como trigger del `update`, así el equipo puede hacer `dbt-poller` o `git sync` sin pasar por la UI.
