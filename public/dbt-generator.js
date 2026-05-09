@@ -347,6 +347,7 @@
         config: {
           schema: `inter_${meta.logical_name || ""}`,
           materialized: meta.silver_materialization || "view",
+          "persist_docs": { relation: true, columns: true },
         },
         columns: cols,
       }],
@@ -388,6 +389,7 @@
     const config = {
       schema: `mart_${meta.logical_name || ""}`,
       materialized: "table",
+      "persist_docs": { relation: true, columns: true },
     };
     if (target.dist_key) config.dist = target.dist_key;
     if (target.sort_keys && target.sort_keys.length) config.sort = target.sort_keys;
@@ -406,11 +408,21 @@
   }
 
   // ============================================================
-  //  SQL generators
+  //  SQL helpers
   // ============================================================
   function indent(s, n) {
     const pad = " ".repeat(n);
     return s.split("\n").map(l => pad + l).join("\n");
+  }
+  function sqlQuote(s) {
+    if (s == null) return "''";
+    return "'" + String(s).replace(/'/g, "''") + "'";
+  }
+  function commentOnTable(fq, desc) {
+    return `COMMENT ON TABLE ${fq} IS ${sqlQuote(desc)};`;
+  }
+  function commentOnColumn(fq, col, desc) {
+    return `COMMENT ON COLUMN ${fq}.${col} IS ${sqlQuote(desc)};`;
   }
 
   function buildSilverSql(project) {
@@ -422,7 +434,8 @@
     const lines = [];
     lines.push(`{{ config(`);
     lines.push(`    materialized='${meta.silver_materialization || "view"}',`);
-    lines.push(`    schema='inter_${meta.logical_name || ""}'`);
+    lines.push(`    schema='inter_${meta.logical_name || ""}',`);
+    lines.push(`    persist_docs={'relation': True, 'columns': True}`);
     lines.push(`) }}`);
     lines.push("");
     lines.push("with raw as (");
@@ -494,7 +507,8 @@
     const lines = [];
     lines.push(`{{ config(`);
     lines.push(`    materialized='table',`);
-    lines.push(`    schema='mart_${meta.logical_name || ""}'${target.dist_key ? "," : ""}`);
+    lines.push(`    schema='mart_${meta.logical_name || ""}',`);
+    lines.push(`    persist_docs={'relation': True, 'columns': True}${target.dist_key ? "," : ""}`);
     if (target.dist_key) lines.push(`    dist='${target.dist_key}'${target.sort_keys && target.sort_keys.length ? "," : ""}`);
     if (target.sort_keys && target.sort_keys.length) lines.push(`    sort=[${target.sort_keys.map(k => `'${k}'`).join(", ")}]`);
     lines.push(`) }}`);
@@ -546,6 +560,99 @@
   }
 
   // ============================================================
+  //  Redshift COMMENTs — SQL ejecutable directo
+  //  Para Silver/Gold también va `persist_docs` en el model config,
+  //  pero estos archivos sirven como fallback idempotente y para Bronze
+  //  (que es source, no model — persist_docs no aplica).
+  // ============================================================
+  function buildCommentsHeader(stage, fq, lastPart) {
+    return [
+      `-- Comentarios Redshift — ${stage}`,
+      `-- Tabla: ${fq}`,
+      `-- Generado por artifact modeler según Nomenclatura Galicia`,
+      `-- Idempotente: COMMENT ON sobreescribe valor anterior`,
+      ``,
+    ].join("\n");
+  }
+
+  function buildBronzeComments(project) {
+    const meta = project.meta || {};
+    const state = project.stages.bronze || {};
+    const fq = `${NAME.bronzeSchema(meta)}.${NAME.bronzeTable(meta)}`;
+    const lines = [buildCommentsHeader("Bronze", fq)];
+
+    const tableDesc = (state.target && state.target.description) ||
+                      (state.source && state.source.description) ||
+                      `Bronze — espejo fiel de ${NAME.bronzeTable(meta)}, inmutable, no consumible`;
+    lines.push(commentOnTable(fq, tableDesc));
+    lines.push("");
+
+    for (const r of (state.rows || [])) {
+      if (!r.source_name || !r.source_name.trim()) continue;
+      if (!r.description || !r.description.trim()) continue;
+      const colName = r.source_name.toLowerCase().replace(/-/g, "_");
+      lines.push(commentOnColumn(fq, colName, r.description.trim()));
+    }
+    lines.push(commentOnColumn(fq, "audit_created_ts_local",
+      "Auditoría — fecha/hora de carga (UTC-3, horario local Argentina)"));
+    return lines.join("\n") + "\n";
+  }
+
+  function buildSilverComments(project) {
+    const meta = project.meta || {};
+    const state = project.stages.silver || {};
+    const fq = `${NAME.silverSchema(meta)}.${NAME.silverTable(meta)}`;
+    const lines = [buildCommentsHeader("Silver", fq)];
+
+    const tableDesc = (state.target && state.target.description) ||
+                      `Silver — ${NAME.silverTable(meta)} tipado y deduplicado`;
+    lines.push(commentOnTable(fq, tableDesc));
+    lines.push("");
+
+    for (const r of (state.rows || [])) {
+      if (!r.target_name || !r.target_name.trim()) continue;
+      if (!r.description || !r.description.trim()) continue;
+      lines.push(commentOnColumn(fq, r.target_name, r.description.trim()));
+    }
+    lines.push(commentOnColumn(fq, "audit_created_ts",
+      "Auditoría — fecha/hora de carga en Silver (UTC-3, horario local Argentina)"));
+    lines.push(commentOnColumn(fq, "audit_data_source_tx",
+      "Auditoría — origen del dato"));
+    return lines.join("\n") + "\n";
+  }
+
+  function buildGoldComments(project) {
+    const meta = project.meta || {};
+    const state = project.stages.gold || {};
+    const fq = `${NAME.goldSchema(meta)}.${NAME.goldTable(meta)}`;
+    const lines = [buildCommentsHeader("Gold", fq)];
+
+    const tableDesc = (state.target && state.target.description) ||
+                      `Gold — ${NAME.goldTable(meta)} (${meta.gold_table_kind || "—"})`;
+    lines.push(commentOnTable(fq, tableDesc));
+    lines.push("");
+
+    // Surrogate key si PK compuesta
+    const keys = (state.rows || []).filter(r => r.is_key && r.target_name);
+    if (keys.length > 1) {
+      const skName = keys.map(k => k.target_name.replace(/_(id|cd|nu)$/i, "")).join("_") + "_id";
+      lines.push(commentOnColumn(fq, skName,
+        `Clave subrogada — hash de ${keys.map(k => k.target_name).join(" + ")}`));
+    }
+
+    for (const r of (state.rows || [])) {
+      if (!r.target_name || !r.target_name.trim()) continue;
+      if (!r.description || !r.description.trim()) continue;
+      lines.push(commentOnColumn(fq, r.target_name, r.description.trim()));
+    }
+    lines.push(commentOnColumn(fq, "audit_created_ts",
+      "Auditoría — fecha/hora de carga en Gold (UTC-3, horario local Argentina)"));
+    lines.push(commentOnColumn(fq, "audit_data_source_tx",
+      "Auditoría — origen del dato"));
+    return lines.join("\n") + "\n";
+  }
+
+  // ============================================================
   //  README — para incluir en el ZIP como contexto
   // ============================================================
   function buildReadme(project) {
@@ -577,13 +684,16 @@
       `\`\`\``,
       `models/`,
       `├── bronze/`,
-      `│   └── _sources.yml`,
+      `│   ├── _sources.yml`,
+      `│   └── _comments.sql      ← COMMENT ON TABLE/COLUMN para Redshift`,
       `├── silver/`,
       `│   ├── _silver__models.yml`,
-      `│   └── ${NAME.silverTable(meta)}.sql`,
+      `│   ├── ${NAME.silverTable(meta)}.sql`,
+      `│   └── _comments.sql      ← fallback ejecutable`,
       `└── gold/`,
       `    ├── _gold__models.yml`,
-      `    └── ${NAME.goldTable(meta)}.sql`,
+      `    ├── ${NAME.goldTable(meta)}.sql`,
+      `    └── _comments.sql      ← fallback ejecutable`,
       `\`\`\``,
       ``,
       `## Cómo integrar en tu proyecto dbt`,
@@ -592,6 +702,20 @@
       `2. Asegurarte de que \`dbt_utils\` esté en \`packages.yml\` (algunos tests lo requieren).`,
       `3. Correr \`dbt parse\` para validar la estructura.`,
       `4. Completar los \`-- TODO\` que pueda haber en los \`.sql\` (transformaciones complejas, dedup logic).`,
+      ``,
+      `## COMMENTs de Redshift`,
+      ``,
+      `Los descriptions del modelado se persisten en el catálogo de Redshift por dos vías complementarias:`,
+      ``,
+      `- **Silver y Gold**: vía \`persist_docs={'relation': True, 'columns': True}\` en el \`{{ config() }}\` del modelo. Cada \`dbt run\` reemite los \`COMMENT ON\`. No requiere acción manual.`,
+      `- **Bronze**: como source no se ejecuta vía dbt, así que generamos \`_comments.sql\` ejecutable manualmente contra Redshift (o desde el job de ingesta una vez creada la tabla).`,
+      `- Los \`_comments.sql\` de Silver y Gold se incluyen como **fallback idempotente** — útiles para correr en entornos donde \`persist_docs\` esté deshabilitado o para repoblar comentarios sin un \`dbt run\` completo.`,
+      ``,
+      `Para ejecutar los comments manualmente:`,
+      ``,
+      `\`\`\`bash`,
+      `psql -h <redshift-host> -d <db> -U <user> -f models/bronze/_comments.sql`,
+      `\`\`\``,
       ``,
       `## Notas`,
       ``,
@@ -613,14 +737,17 @@
 
     // Bronze
     zip.file("models/bronze/_sources.yml", buildBronzeYaml(project));
+    zip.file("models/bronze/_comments.sql", buildBronzeComments(project));
 
     // Silver
     zip.file("models/silver/_silver__models.yml", buildSilverYaml(project));
     zip.file(`models/silver/${NAME.silverTable(meta)}.sql`, buildSilverSql(project));
+    zip.file("models/silver/_comments.sql", buildSilverComments(project));
 
     // Gold
     zip.file("models/gold/_gold__models.yml", buildGoldYaml(project));
     zip.file(`models/gold/${NAME.goldTable(meta)}.sql`, buildGoldSql(project));
+    zip.file("models/gold/_comments.sql", buildGoldComments(project));
 
     // README
     zip.file("README.md", buildReadme(project));
@@ -723,6 +850,9 @@
     buildGoldYaml,
     buildSilverSql,
     buildGoldSql,
+    buildBronzeComments,
+    buildSilverComments,
+    buildGoldComments,
     buildReadme,
     buildZip,
     downloadZip,

@@ -158,10 +158,13 @@ function Modeler({ auth, onLogout }) {
   // dbt outputs (siempre frescos sobre el project completo)
   const dbtOutputs = useMemo(() => ({
     "bronze.yml":  window.DBT.buildBronzeYaml(project),
+    "bronze.sql":  window.DBT.buildBronzeComments(project),
     "silver.yml":  window.DBT.buildSilverYaml(project),
     "silver.sql":  window.DBT.buildSilverSql(project),
+    "silver-comments.sql": window.DBT.buildSilverComments(project),
     "gold.yml":    window.DBT.buildGoldYaml(project),
     "gold.sql":    window.DBT.buildGoldSql(project),
+    "gold-comments.sql":   window.DBT.buildGoldComments(project),
   }), [project]);
 
   // Lints
@@ -667,10 +670,13 @@ function Preview({ previewText, previewMode, setPreviewMode, copy, download, dow
     { id: "json", label: "artifact.json", cls: "" },
     { id: "yaml", label: "artifact.yml", cls: "" },
     { id: "bronze.yml", label: "bronze · _sources.yml", cls: "dbt" },
+    { id: "bronze.sql", label: "bronze · _comments.sql", cls: "dbt" },
     { id: "silver.yml", label: "silver · _models.yml", cls: "dbt" },
     { id: "silver.sql", label: "silver · .sql", cls: "dbt" },
+    { id: "silver-comments.sql", label: "silver · _comments.sql", cls: "dbt" },
     { id: "gold.yml", label: "gold · _models.yml", cls: "dbt" },
     { id: "gold.sql", label: "gold · .sql", cls: "dbt" },
+    { id: "gold-comments.sql", label: "gold · _comments.sql", cls: "dbt" },
   ];
 
   return (
@@ -722,7 +728,7 @@ function highlight(text, mode){
       .replace(/:\s*(-?\d+(?:\.\d+)?)/g, (m,n)=>`: <span class="n">${n}</span>`);
   }
   if (mode.endsWith(".sql")) {
-    const KW = /\b(select|from|where|with|as|cast|case|when|then|else|end|coalesce|null|and|or|not|join|inner|left|right|on|order|by|group|having|union|all|over|partition|distinct|create|table|view|insert|update|delete|set|in|is|like|between|exists|materialized|config|source|ref|md5|convert_timezone|getdate|to_date|to_timestamp|substring|row_number)\b/gi;
+    const KW = /\b(select|from|where|with|as|cast|case|when|then|else|end|coalesce|null|and|or|not|join|inner|left|right|on|order|by|group|having|union|all|over|partition|distinct|create|table|view|insert|update|delete|set|in|is|like|between|exists|materialized|config|source|ref|md5|convert_timezone|getdate|to_date|to_timestamp|substring|row_number|comment)\b/gi;
     return e
       .replace(/(--[^\n]*)/g, '<span class="b">$1</span>')
       .replace(/('[^']*')/g, '<span class="s">$1</span>')
