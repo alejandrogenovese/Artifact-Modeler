@@ -24,8 +24,12 @@
   <!-- Babel standalone — transpila JSX en el browser. Pesado (~3MB) pero no requiere build. -->
   <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
 
+  <!-- JSZip — para empaquetar el bundle dbt como descarga -->
+  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+
   <script src="helpers.js"></script>
   <script src="seed.js"></script>
+  <script src="dbt-generator.js"></script>
   <script type="text/babel" data-presets="env,react" src="app.jsx"></script>
 </body>
 </html>

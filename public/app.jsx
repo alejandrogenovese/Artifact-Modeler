@@ -32,6 +32,7 @@ function defaultStateForStage(stage) {
 function defaultProject() {
   return {
     activeStage: "bronze",
+    meta: window.DBT.defaultMeta(),
     stages: {
       bronze: defaultStateForStage("bronze"),
       silver: defaultStateForStage("silver"),
@@ -45,6 +46,12 @@ function loadProject() {
     if (!raw) return defaultProject();
     const p = JSON.parse(raw);
     if (!p.stages) return defaultProject();
+    // Migración: asegurar p.meta (deducir de schemas legacy si no existe)
+    if (!p.meta) {
+      p.meta = { ...window.DBT.defaultMeta(), ...window.DBT.inferMetaFromLegacy(p) };
+    } else {
+      p.meta = { ...window.DBT.defaultMeta(), ...p.meta };
+    }
     return p;
   } catch(e){ return defaultProject(); }
 }
@@ -124,6 +131,7 @@ function Modeler({ auth, onLogout }) {
   const [project, setProject] = useState(loadProject);
   const [previewMode, setPreviewMode] = useState("json");
   const [toast, setToast] = useState(null);
+  const [metaOpen, setMetaOpen] = useState(false);
   const fileRef = useRef(null);
 
   useEffect(() => {
@@ -132,17 +140,39 @@ function Modeler({ auth, onLogout }) {
 
   const stage = project.activeStage;
   const state = project.stages[stage];
+  const meta = project.meta;
   const flashToast = (m) => { setToast(m); setTimeout(()=>setToast(null), 1800); };
 
   const setStageState = (partial) => setProject(p => ({
     ...p, stages: { ...p.stages, [stage]: typeof partial === "function" ? partial(p.stages[stage]) : { ...p.stages[stage], ...partial } }
   }));
   const switchStage = (s) => setProject(p => ({ ...p, activeStage: s }));
+  const setMeta = (partial) => setProject(p => ({
+    ...p, meta: typeof partial === "function" ? partial(p.meta) : { ...p.meta, ...partial }
+  }));
 
   const issues = useMemo(() => stage === "bronze" ? H.validatePositions(state.rows) : [], [state.rows, stage]);
   const issuesByRow = useMemo(() => { const m={}; for(const i of issues){(m[i.id]=m[i.id]||[]).push(i);} return m; }, [issues]);
   const artifact = useMemo(() => H.buildArtifact(state), [state]);
-  const previewText = useMemo(() => previewMode === "json" ? JSON.stringify(artifact, null, 2) : H.toYaml(artifact), [artifact, previewMode]);
+
+  // dbt outputs (siempre frescos sobre el project completo)
+  const dbtOutputs = useMemo(() => ({
+    "bronze.yml":  window.DBT.buildBronzeYaml(project),
+    "silver.yml":  window.DBT.buildSilverYaml(project),
+    "silver.sql":  window.DBT.buildSilverSql(project),
+    "gold.yml":    window.DBT.buildGoldYaml(project),
+    "gold.sql":    window.DBT.buildGoldSql(project),
+  }), [project]);
+
+  // Lints
+  const lintRows = useMemo(() => window.DBT.lintProject(project), [project]);
+  const lintMetaIssues = useMemo(() => window.DBT.lintMeta(meta), [meta]);
+
+  const previewText = useMemo(() => {
+    if (previewMode === "json") return JSON.stringify(artifact, null, 2);
+    if (previewMode === "yaml") return H.toYaml(artifact);
+    return dbtOutputs[previewMode] || "";
+  }, [artifact, previewMode, dbtOutputs]);
 
   const stats = useMemo(() => {
     const total = state.rows.length;
@@ -200,10 +230,24 @@ function Modeler({ auth, onLogout }) {
   };
   const downloadArtifact = () => {
     const text = previewText;
-    const blob = new Blob([text], { type: previewMode === "json" ? "application/json" : "text/yaml" });
+    let mime = "text/plain", ext = "txt";
+    if (previewMode === "json") { mime = "application/json"; ext = "json"; }
+    else if (previewMode === "yaml" || previewMode.endsWith(".yml")) { mime = "text/yaml"; ext = "yml"; }
+    else if (previewMode.endsWith(".sql")) { mime = "text/plain"; ext = "sql"; }
+    const blob = new Blob([text], { type: mime });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = `artifact_${stage}_${state.target.table || "table"}.${previewMode === "json" ? "json" : "yml"}`;
-    a.click(); URL.revokeObjectURL(a.href); flashToast(`Artefacto ${stage} descargado`);
+    const dpName = (project.meta && project.meta.logical_name) || state.target.table || "artifact";
+    const stagePart = previewMode.includes(".") ? previewMode.replace(".", "_") : `${stage}.${ext}`;
+    a.download = `${dpName}__${stagePart.replace(/\./g,"_")}.${ext}`;
+    a.click(); URL.revokeObjectURL(a.href); flashToast(`${previewMode} descargado`);
+  };
+  const downloadDbtZip = async () => {
+    try {
+      const fname = await window.DBT.downloadZip(project);
+      flashToast(`ZIP descargado: ${fname}`);
+    } catch(e) {
+      flashToast("Error al generar ZIP: " + e.message);
+    }
   };
   const copyPreview = async () => { try { await navigator.clipboard.writeText(previewText); flashToast("Copiado"); } catch(e){ flashToast("No se pudo copiar"); } };
   const triggerLoad = () => fileRef.current && fileRef.current.click();
@@ -250,7 +294,7 @@ function Modeler({ auth, onLogout }) {
           <button className="btn btn-ghost" onClick={downloadProject}>💾 Guardar</button>
           <button className="btn btn-ghost" onClick={resetStage}>↺ Ejemplo</button>
           <button className="btn btn-ghost" onClick={clearStage}>🗑 Vaciar</button>
-          <button className="btn btn-accent" onClick={downloadArtifact}>↓ Exportar dbt</button>
+          <button className="btn btn-accent" onClick={downloadDbtZip} title="Descarga ZIP con models/ listo para dbt">📦 ZIP dbt</button>
           <input ref={fileRef} type="file" accept=".json,application/json" className="hidden-file" onChange={onLoadFile} />
           <div className="user-chip">
             <div className="avatar">{(auth.user || "?").substring(0,1).toUpperCase()}</div>
@@ -262,6 +306,14 @@ function Modeler({ auth, onLogout }) {
 
       <StageBar active={stage} onSwitch={switchStage} project={project} />
 
+      <ProjectMetaPanel
+        meta={meta}
+        setMeta={setMeta}
+        open={metaOpen}
+        setOpen={setMetaOpen}
+        issues={lintMetaIssues}
+      />
+
       <div className="app">
         <main className="workspace">
           <SourceConfig stage={stage} state={state} patchSource={patchSource} patchProcess={(v)=>setStageState({process_sql:v})} />
@@ -272,7 +324,8 @@ function Modeler({ auth, onLogout }) {
           <ProcessSection state={state} setProcess={(v)=>setStageState({process_sql:v})} />
         </main>
         <Preview previewText={previewText} previewMode={previewMode} setPreviewMode={setPreviewMode}
-          copy={copyPreview} download={downloadArtifact} stats={stats} stage={stage} />
+          copy={copyPreview} download={downloadArtifact} downloadZip={downloadDbtZip}
+          stats={stats} stage={stage} lintRows={lintRows} />
       </div>
       {toast && <div className="toast">{toast}</div>}
     </React.Fragment>
@@ -597,23 +650,61 @@ function ProcessSection({ state, setProcess }) {
   );
 }
 
-function Preview({ previewText, previewMode, setPreviewMode, copy, download, stats, stage }) {
+function Preview({ previewText, previewMode, setPreviewMode, copy, download, downloadZip, stats, stage, lintRows }) {
   const html = useMemo(() => highlight(previewText, previewMode), [previewText, previewMode]);
+
+  // ¿Qué stage corresponde al tab activo (para mostrar lints relevantes)?
+  const lintStage = useMemo(() => {
+    if (previewMode.startsWith("bronze")) return "bronze";
+    if (previewMode.startsWith("silver")) return "silver";
+    if (previewMode.startsWith("gold")) return "gold";
+    return stage;
+  }, [previewMode, stage]);
+  const stageLints = (lintRows && lintRows[lintStage]) || [];
+  const hasErrors = stageLints.some(l => l.level === "error");
+
+  const TABS = [
+    { id: "json", label: "artifact.json", cls: "" },
+    { id: "yaml", label: "artifact.yml", cls: "" },
+    { id: "bronze.yml", label: "bronze · _sources.yml", cls: "dbt" },
+    { id: "silver.yml", label: "silver · _models.yml", cls: "dbt" },
+    { id: "silver.sql", label: "silver · .sql", cls: "dbt" },
+    { id: "gold.yml", label: "gold · _models.yml", cls: "dbt" },
+    { id: "gold.sql", label: "gold · .sql", cls: "dbt" },
+  ];
+
   return (
     <aside className="preview">
       <header className="preview-head">
         <div className="preview-tabs">
-          <button className={`preview-tab ${previewMode==="json"?"active":""}`} onClick={()=>setPreviewMode("json")}>artifact.json</button>
-          <button className={`preview-tab ${previewMode==="yaml"?"active":""}`} onClick={()=>setPreviewMode("yaml")}>artifact.yml</button>
+          {TABS.map(t => (
+            <button key={t.id}
+              className={`preview-tab ${t.cls} ${previewMode === t.id ? "active" : ""}`}
+              onClick={()=>setPreviewMode(t.id)}>{t.label}</button>
+          ))}
         </div>
         <div className="preview-actions">
           <button className="btn btn-ghost btn-tiny" onClick={copy}>⎘ Copiar</button>
-          <button className="btn btn-accent btn-tiny" onClick={download}>↓ Descargar</button>
+          <button className="btn btn-soft btn-tiny" onClick={download}>↓ Archivo</button>
+          <button className="btn btn-accent btn-tiny" onClick={downloadZip} title="Descarga ZIP completo con models/ listo para dbt">📦 ZIP</button>
         </div>
       </header>
+      {stageLints.length > 0 && (previewMode.includes(".") || lintStage !== "bronze") && (
+        <div className={`lint-strip ${hasErrors ? "error-strip" : ""}`}>
+          {stageLints.slice(0, 8).map((l, i) => (
+            <div key={i} className="lint-line">
+              <span>{l.level === "error" ? "✕" : "!"}</span>
+              <span className="lint-name">{l.target_name}</span>
+              <span>—</span>
+              <span>{l.msg}</span>
+            </div>
+          ))}
+          {stageLints.length > 8 && <div className="lint-line">… y {stageLints.length - 8} más</div>}
+        </div>
+      )}
       <div className="preview-body" dangerouslySetInnerHTML={{__html: html}} />
       <footer className="preview-foot">
-        <span>{stage} · {stats.filled}/{stats.total} cols</span>
+        <span>{lintStage} · {stats.filled}/{stats.total} cols{stageLints.length > 0 && ` · ${stageLints.length} lints`}</span>
         <span>{previewText.split("\n").length} líneas</span>
       </footer>
     </aside>
@@ -630,11 +721,166 @@ function highlight(text, mode){
       .replace(/:\s*(true|false|null)\b/g, (m,b)=>`: <span class="b">${b}</span>`)
       .replace(/:\s*(-?\d+(?:\.\d+)?)/g, (m,n)=>`: <span class="n">${n}</span>`);
   }
+  if (mode.endsWith(".sql")) {
+    const KW = /\b(select|from|where|with|as|cast|case|when|then|else|end|coalesce|null|and|or|not|join|inner|left|right|on|order|by|group|having|union|all|over|partition|distinct|create|table|view|insert|update|delete|set|in|is|like|between|exists|materialized|config|source|ref|md5|convert_timezone|getdate|to_date|to_timestamp|substring|row_number)\b/gi;
+    return e
+      .replace(/(--[^\n]*)/g, '<span class="b">$1</span>')
+      .replace(/('[^']*')/g, '<span class="s">$1</span>')
+      .replace(/(\{\{[^}]+\}\})/g, '<span class="k">$1</span>')
+      .replace(KW, '<span class="k">$1</span>')
+      .replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="n">$1</span>');
+  }
+  // yaml (default + .yml)
   return e
     .replace(/^(\s*-?\s*)([A-Za-z_][\w-]*)(\s*:)/gm, '$1<span class="k">$2</span>$3')
     .replace(/:\s*(true|false|null)\b/g, (m,b)=>`: <span class="b">${b}</span>`)
     .replace(/:\s*(-?\d+(?:\.\d+)?)/gm, (m,n)=>`: <span class="n">${n}</span>`)
     .replace(/:\s*("[^"]*")/g, (m,q)=>`: <span class="s">${q}</span>`);
+}
+
+function ProjectMetaPanel({ meta, setMeta, open, setOpen, issues }) {
+  const D = window.DBT;
+  const completeness = useMemo(() => {
+    const required = ["data_product", "sigla_aplicativa", "logical_name",
+                      "bronze_interface_name", "silver_table_name",
+                      "gold_table_kind", "gold_content_name"];
+    const filled = required.filter(k => meta[k] && String(meta[k]).trim()).length;
+    return { filled, total: required.length };
+  }, [meta]);
+  const ok = completeness.filled === completeness.total &&
+             !issues.some(i => i.level === "error");
+
+  const u = (k) => (e) => setMeta({ [k]: e.target.value });
+
+  // Computed previews
+  const computed = {
+    bronzeSchema: D.NAME.bronzeSchema(meta),
+    bronzeTable:  D.NAME.bronzeTable(meta),
+    silverSchema: D.NAME.silverSchema(meta),
+    silverTable:  D.NAME.silverTable(meta),
+    goldSchema:   D.NAME.goldSchema(meta),
+    goldTable:    D.NAME.goldTable(meta),
+    goldViewSchema: D.NAME.goldViewSchema(meta),
+  };
+
+  const isFact = meta.gold_table_kind === "fact";
+  const needsFreq = isFact && (meta.gold_fact_use === "snap" || meta.gold_fact_use === "agr");
+
+  return (
+    <div className={`meta-panel ${open ? "open" : ""}`}>
+      <div className="meta-panel-head" onClick={()=>setOpen(!open)}>
+        <div className="meta-panel-title">Identidad del Data Product</div>
+        <div className="meta-panel-summary">
+          <span>dp <b className="mono">{meta.data_product || "—"}</b></span>
+          <span>sigla <b className="mono">{meta.sigla_aplicativa || "—"}</b></span>
+          <span>logical <b className="mono">{meta.logical_name || "—"}</b></span>
+          {ok
+            ? <span className="badge-ok">✓ completo</span>
+            : <span className="badge-warn">{completeness.filled}/{completeness.total} · revisar</span>}
+        </div>
+      </div>
+      <div className="meta-panel-body">
+        <div className="meta-grid">
+          <div>
+            <label>Data Product</label>
+            <input type="text" value={meta.data_product} onChange={u("data_product")}
+              placeholder="w001" maxLength={6} />
+          </div>
+          <div>
+            <label>Sigla aplicativa</label>
+            <input type="text" value={meta.sigla_aplicativa} onChange={u("sigla_aplicativa")}
+              placeholder="nv" />
+          </div>
+          <div>
+            <label>Logical name</label>
+            <input type="text" value={meta.logical_name} onChange={u("logical_name")}
+              placeholder="cliente" />
+          </div>
+          <div>
+            <label>Dominio (opcional)</label>
+            <input type="text" value={meta.domain} onChange={u("domain")}
+              placeholder="cliente, cuenta_monetaria, …" />
+          </div>
+
+          <div className="field-full" style={{height:1, background:"var(--border)", margin:"4px 0"}} />
+
+          <div>
+            <label>Bronze · interface name</label>
+            <input className="mono" type="text" value={meta.bronze_interface_name}
+              onChange={u("bronze_interface_name")}
+              placeholder="pr_nv_intd10_dwho_personas" />
+          </div>
+          <div>
+            <label>Silver · table name</label>
+            <input className="mono" type="text" value={meta.silver_table_name}
+              onChange={u("silver_table_name")}
+              placeholder="cliente_individuo" />
+          </div>
+          <div>
+            <label>Silver · materialización</label>
+            <select value={meta.silver_materialization} onChange={u("silver_materialization")}>
+              <option value="view">view (efímero)</option>
+              <option value="table">table (físico)</option>
+              <option value="ephemeral">ephemeral (CTE)</option>
+            </select>
+          </div>
+          <div></div>
+
+          <div>
+            <label>Gold · tipo</label>
+            <select value={meta.gold_table_kind} onChange={u("gold_table_kind")}>
+              <option value="dim">dim (lookup/maestro)</option>
+              <option value="fact">fact (hechos)</option>
+            </select>
+          </div>
+          <div className={!isFact ? "field-disabled" : ""}>
+            <label>Uso fact</label>
+            <select value={meta.gold_fact_use} onChange={u("gold_fact_use")} disabled={!isFact}>
+              <option value="">—</option>
+              <option value="snap">snap (saldos/snapshot)</option>
+              <option value="trx">trx (transacciones/eventos)</option>
+              <option value="agr">agr (agregaciones)</option>
+            </select>
+          </div>
+          <div className={!needsFreq ? "field-disabled" : ""}>
+            <label>Frecuencia</label>
+            <select value={meta.gold_frequency} onChange={u("gold_frequency")} disabled={!needsFreq}>
+              <option value="">—</option>
+              <option value="dia">dia</option>
+              <option value="mes">mes</option>
+              <option value="trim">trim</option>
+              <option value="anio">anio</option>
+            </select>
+          </div>
+          <div>
+            <label>Gold · content name</label>
+            <input className="mono" type="text" value={meta.gold_content_name}
+              onChange={u("gold_content_name")}
+              placeholder="cliente_individuo" />
+          </div>
+        </div>
+
+        <div className="meta-preview">
+          <div className="meta-preview-label">bronze schema.tabla</div>
+          <div className="meta-preview-value">{computed.bronzeSchema}.{computed.bronzeTable}</div>
+          <div className="meta-preview-label">silver schema.tabla</div>
+          <div className="meta-preview-value">{computed.silverSchema}.{computed.silverTable}</div>
+          <div className="meta-preview-label">gold schema.tabla</div>
+          <div className="meta-preview-value">{computed.goldSchema}.{computed.goldTable}</div>
+          <div className="meta-preview-label">gold views schema</div>
+          <div className="meta-preview-value">{computed.goldViewSchema}</div>
+        </div>
+
+        {issues.length > 0 && (
+          <div className="meta-issues">
+            {issues.map((i, k) => (
+              <div key={k} className={`meta-issue ${i.level}`}>{i.msg}</div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
