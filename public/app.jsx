@@ -33,6 +33,7 @@ function defaultProject() {
   return {
     activeStage: "bronze",
     meta: window.DBT.defaultMeta(),
+    comments: window.DBT.defaultComments(),
     stages: {
       bronze: defaultStateForStage("bronze"),
       silver: defaultStateForStage("silver"),
@@ -46,11 +47,22 @@ function loadProject() {
     if (!raw) return defaultProject();
     const p = JSON.parse(raw);
     if (!p.stages) return defaultProject();
-    // Migración: asegurar p.meta (deducir de schemas legacy si no existe)
     if (!p.meta) {
       p.meta = { ...window.DBT.defaultMeta(), ...window.DBT.inferMetaFromLegacy(p) };
     } else {
       p.meta = { ...window.DBT.defaultMeta(), ...p.meta };
+    }
+    if (!p.comments) p.comments = window.DBT.defaultComments();
+    else {
+      const dc = window.DBT.defaultComments();
+      p.comments = {
+        bronze: { ...dc.bronze, ...(p.comments.bronze || {}),
+                  columns: { ...(p.comments.bronze && p.comments.bronze.columns) || {} } },
+        silver: { ...dc.silver, ...(p.comments.silver || {}),
+                  columns: { ...(p.comments.silver && p.comments.silver.columns) || {} } },
+        gold:   { ...dc.gold,   ...(p.comments.gold || {}),
+                  columns: { ...(p.comments.gold && p.comments.gold.columns) || {} } },
+      };
     }
     return p;
   } catch(e){ return defaultProject(); }
@@ -132,6 +144,7 @@ function Modeler({ auth, onLogout }) {
   const [previewMode, setPreviewMode] = useState("json");
   const [toast, setToast] = useState(null);
   const [metaOpen, setMetaOpen] = useState(false);
+  const [commentsOpen, setCommentsOpen] = useState(false);
   const fileRef = useRef(null);
 
   useEffect(() => {
@@ -149,6 +162,33 @@ function Modeler({ auth, onLogout }) {
   const switchStage = (s) => setProject(p => ({ ...p, activeStage: s }));
   const setMeta = (partial) => setProject(p => ({
     ...p, meta: typeof partial === "function" ? partial(p.meta) : { ...p.meta, ...partial }
+  }));
+
+  const setTableComment = (stage, text) => setProject(p => ({
+    ...p,
+    comments: {
+      ...p.comments,
+      [stage]: { ...p.comments[stage], table: text },
+    },
+  }));
+  const setColumnComment = (stage, col, text) => setProject(p => ({
+    ...p,
+    comments: {
+      ...p.comments,
+      [stage]: {
+        ...p.comments[stage],
+        columns: { ...p.comments[stage].columns, [col]: text },
+      },
+    },
+  }));
+  const removeColumnComment = (stage, col) => setProject(p => {
+    const cols = { ...p.comments[stage].columns };
+    delete cols[col];
+    return { ...p, comments: { ...p.comments, [stage]: { ...p.comments[stage], columns: cols } } };
+  });
+  const resetStageComments = (stage) => setProject(p => ({
+    ...p,
+    comments: { ...p.comments, [stage]: { table: "", columns: {} } },
   }));
 
   const issues = useMemo(() => stage === "bronze" ? H.validatePositions(state.rows) : [], [state.rows, stage]);
@@ -297,6 +337,7 @@ function Modeler({ auth, onLogout }) {
           <button className="btn btn-ghost" onClick={downloadProject}>💾 Guardar</button>
           <button className="btn btn-ghost" onClick={resetStage}>↺ Ejemplo</button>
           <button className="btn btn-ghost" onClick={clearStage}>🗑 Vaciar</button>
+          <button className="btn btn-ghost" onClick={()=>setCommentsOpen(true)} title="Editor de COMMENTs Redshift">💬 Comments</button>
           <button className="btn btn-accent" onClick={downloadDbtZip} title="Descarga ZIP con models/ listo para dbt">📦 ZIP dbt</button>
           <input ref={fileRef} type="file" accept=".json,application/json" className="hidden-file" onChange={onLoadFile} />
           <div className="user-chip">
@@ -331,6 +372,16 @@ function Modeler({ auth, onLogout }) {
           stats={stats} stage={stage} lintRows={lintRows} />
       </div>
       {toast && <div className="toast">{toast}</div>}
+      {commentsOpen && (
+        <CommentsEditor
+          project={project}
+          onClose={()=>setCommentsOpen(false)}
+          setTableComment={setTableComment}
+          setColumnComment={setColumnComment}
+          removeColumnComment={removeColumnComment}
+          resetStageComments={resetStageComments}
+        />
+      )}
     </React.Fragment>
   );
 }
@@ -515,7 +566,7 @@ function FieldsTable({ stage, state, stats, issuesByRow, patchRow, addRow, remov
               <th></th><th></th>
               <th colSpan={isBronze?7:2} className="group origen">{isBronze ? "Sistema de Origen" : "Origen"}</th>
               {!isBronze && <th className="group transf">Transformación</th>}
-              <th colSpan={isBronze?3:2} className="group destino">Destino</th>
+              <th colSpan={isBronze?3:3} className="group destino">Destino</th>
               <th colSpan="5" className="group valid">Validaciones</th>
               <th></th>
             </tr>
@@ -527,6 +578,7 @@ function FieldsTable({ stage, state, stats, issuesByRow, patchRow, addRow, remov
               {!isBronze && <th>Transformación SQL</th>}
               <th>Campo destino</th>
               <th>Tipo destino</th>
+              {!isBronze && <th title="Comment Redshift / dbt description">Descripción</th>}
               {isBronze && <th>Transformación</th>}
               <th title="Nullable">Null</th>
               <th title="Es clave">PK</th>
@@ -600,6 +652,14 @@ function FieldRow({ row, idx, stage, patchRow, removeRow, dupRow, suggestTarget,
       <td className="w-target-type">
         <input className="cell-input" value={row.target_type} placeholder="VARCHAR(n)" onChange={e=>u("target_type", e.target.value)} />
       </td>
+      {!isBronze && (
+        <td className="w-description">
+          <input className="cell-input" value={row.description || ""}
+            placeholder="Descripción (= COMMENT en Redshift)"
+            onChange={e=>u("description", e.target.value)}
+            title="Esta descripción se persiste en Redshift como COMMENT ON COLUMN vía persist_docs y _comments.sql" />
+        </td>
+      )}
       {isBronze && (
         <td className="w-transformation">
           <input className="cell-input" value={row.transformation} onChange={e=>u("transformation", e.target.value)} />
@@ -663,7 +723,14 @@ function Preview({ previewText, previewMode, setPreviewMode, copy, download, dow
     if (previewMode.startsWith("gold")) return "gold";
     return stage;
   }, [previewMode, stage]);
-  const stageLints = (lintRows && lintRows[lintStage]) || [];
+  const stageLints = useMemo(() => {
+    const arr = (lintRows && lintRows[lintStage]) || [];
+    // errores primero, luego warnings
+    return [...arr].sort((a, b) => {
+      if (a.level === b.level) return 0;
+      return a.level === "error" ? -1 : 1;
+    });
+  }, [lintRows, lintStage]);
   const hasErrors = stageLints.some(l => l.level === "error");
 
   const TABS = [
@@ -695,9 +762,9 @@ function Preview({ previewText, previewMode, setPreviewMode, copy, download, dow
           <button className="btn btn-accent btn-tiny" onClick={downloadZip} title="Descarga ZIP completo con models/ listo para dbt">📦 ZIP</button>
         </div>
       </header>
-      {stageLints.length > 0 && (previewMode.includes(".") || lintStage !== "bronze") && (
+      {stageLints.length > 0 && (
         <div className={`lint-strip ${hasErrors ? "error-strip" : ""}`}>
-          {stageLints.slice(0, 8).map((l, i) => (
+          {stageLints.slice(0, 15).map((l, i) => (
             <div key={i} className="lint-line">
               <span>{l.level === "error" ? "✕" : "!"}</span>
               <span className="lint-name">{l.target_name}</span>
@@ -705,7 +772,7 @@ function Preview({ previewText, previewMode, setPreviewMode, copy, download, dow
               <span>{l.msg}</span>
             </div>
           ))}
-          {stageLints.length > 8 && <div className="lint-line">… y {stageLints.length - 8} más</div>}
+          {stageLints.length > 15 && <div className="lint-line">… y {stageLints.length - 15} más</div>}
         </div>
       )}
       <div className="preview-body" dangerouslySetInnerHTML={{__html: html}} />
@@ -884,6 +951,147 @@ function ProjectMetaPanel({ meta, setMeta, open, setOpen, issues }) {
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function CommentsEditor({ project, onClose, setTableComment, setColumnComment, removeColumnComment, resetStageComments }) {
+  const D = window.DBT;
+  const [stage, setStage] = useState("bronze");
+
+  // ESC para cerrar
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const targets = useMemo(() => D.listCommentTargets(project, stage), [project, stage]);
+  const orphans = useMemo(() => D.listOrphanComments(project, stage), [project, stage]);
+  const tableDefault = useMemo(() => D.defaultTableComment(project, stage), [project, stage]);
+  const tableValue = (project.comments[stage] && project.comments[stage].table) || "";
+  const cols = (project.comments[stage] && project.comments[stage].columns) || {};
+
+  const editedCount = Object.values(cols).filter(v => v && String(v).trim()).length;
+
+  const fqMap = {
+    bronze: D.NAME.bronzeSchema(project.meta) + "." + D.NAME.bronzeTable(project.meta),
+    silver: D.NAME.silverSchema(project.meta) + "." + D.NAME.silverTable(project.meta),
+    gold:   D.NAME.goldSchema(project.meta)   + "." + D.NAME.goldTable(project.meta),
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-shell" onClick={e=>e.stopPropagation()}>
+        <header className="modal-head">
+          <div className="modal-title">
+            <span>💬</span>
+            <span>Editor de COMMENTs Redshift</span>
+            <span className="modal-sub">se aplican al <span className="mono">_comments.sql</span> y al <span className="mono">description</span> de los YAML (persist_docs)</span>
+          </div>
+          <button className="btn btn-ghost btn-tiny" onClick={onClose}>✕ cerrar</button>
+        </header>
+
+        <div className="modal-tabs">
+          {["bronze","silver","gold"].map(s => {
+            const c = (project.comments[s] && project.comments[s].columns) || {};
+            const hasTable = project.comments[s] && project.comments[s].table;
+            const cnt = Object.values(c).filter(v=>v && String(v).trim()).length + (hasTable ? 1 : 0);
+            return (
+              <button key={s}
+                className={`modal-tab ${s} ${stage===s?"active":""}`}
+                onClick={()=>setStage(s)}>
+                <b>{s}</b>
+                {cnt > 0 && <span className="modal-tab-badge">{cnt}</span>}
+              </button>
+            );
+          })}
+          <div className="modal-tab-meta mono">{fqMap[stage]}</div>
+          <button className="btn btn-soft btn-tiny" style={{marginLeft:"auto"}}
+            onClick={()=>{ if(confirm(`¿Borrar todos los overrides de ${stage}?`)) resetStageComments(stage); }}>
+            ↺ Resetear stage
+          </button>
+        </div>
+
+        <div className="modal-body">
+          <div className="comments-table-row table-row">
+            <div className="comments-col-name mono">
+              <div className="comments-col-tag table">TABLE</div>
+              <div>{fqMap[stage]}</div>
+            </div>
+            <div className="comments-col-default" title="Descripción por defecto del modelado">
+              {tableDefault}
+            </div>
+            <div className="comments-col-edit">
+              <textarea
+                value={tableValue}
+                placeholder={tableDefault}
+                onChange={e=>setTableComment(stage, e.target.value)}
+                rows={2}
+              />
+              {tableValue && (
+                <button className="btn btn-tiny btn-soft comments-clear" onClick={()=>setTableComment(stage, "")} title="Borrar override (vuelve al default)">↺</button>
+              )}
+            </div>
+          </div>
+
+          <div className="comments-divider">Columnas <span className="mono">({targets.length})</span></div>
+
+          {targets.map(t => {
+            const current = cols[t.col] || "";
+            return (
+              <div key={t.col} className={`comments-table-row ${t.isAudit?"audit":""} ${t.isSurrogate?"surrogate":""} ${current?"edited":""}`}>
+                <div className="comments-col-name mono">
+                  {t.isAudit && <div className="comments-col-tag audit">AUDIT</div>}
+                  {t.isSurrogate && <div className="comments-col-tag surrogate">SK</div>}
+                  <div>{t.col}</div>
+                </div>
+                <div className="comments-col-default" title="Descripción del modelado / default">
+                  {t.defaultDesc || <span className="placeholder">— sin descripción —</span>}
+                </div>
+                <div className="comments-col-edit">
+                  <textarea
+                    value={current}
+                    placeholder={t.defaultDesc || "Sin descripción default — escribí acá para que se emita COMMENT"}
+                    onChange={e=>setColumnComment(stage, t.col, e.target.value)}
+                    rows={2}
+                  />
+                  {current && (
+                    <button className="btn btn-tiny btn-soft comments-clear" onClick={()=>removeColumnComment(stage, t.col)} title="Borrar override">↺</button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {orphans.length > 0 && (
+            <>
+              <div className="comments-divider warn">
+                Comments huérfanos <span className="mono">({orphans.length})</span>
+                <span className="comments-divider-hint"> — pertenecen a columnas que ya no existen en el modelado</span>
+              </div>
+              {orphans.map(col => (
+                <div key={col} className="comments-table-row orphan">
+                  <div className="comments-col-name mono">
+                    <div className="comments-col-tag orphan">ORPHAN</div>
+                    <div>{col}</div>
+                  </div>
+                  <div className="comments-col-default placeholder">— columna no presente —</div>
+                  <div className="comments-col-edit">
+                    <textarea value={cols[col] || ""} readOnly rows={2} />
+                    <button className="btn btn-tiny btn-danger comments-clear" onClick={()=>removeColumnComment(stage, col)} title="Eliminar override">✕</button>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
+        <footer className="modal-foot">
+          <span className="mono">{editedCount} override(s) en {stage}</span>
+          <span className="mono" style={{opacity:0.6}}>ESC para cerrar</span>
+        </footer>
       </div>
     </div>
   );

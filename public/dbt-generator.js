@@ -91,12 +91,112 @@
   }
 
   // ============================================================
+  //  Comment overrides — leídos desde project.comments[stage]
+  // ============================================================
+  function defaultComments() {
+    return {
+      bronze: { table: "", columns: {} },
+      silver: { table: "", columns: {} },
+      gold:   { table: "", columns: {} },
+    };
+  }
+  function getTableComment(project, stage, fallback) {
+    const c = project && project.comments && project.comments[stage] && project.comments[stage].table;
+    return (c && String(c).trim()) ? String(c).trim() : (fallback || "");
+  }
+  function getColumnComment(project, stage, colName, fallback) {
+    const c = project && project.comments && project.comments[stage]
+            && project.comments[stage].columns && project.comments[stage].columns[colName];
+    return (c && String(c).trim()) ? String(c).trim() : (fallback || "");
+  }
+
+  // Lista compacta de las columnas que figurarán en los COMMENTs por capa.
+  // Útil para la UI del editor: incluye audit fields y surrogate key.
+  function listCommentTargets(project, stage) {
+    const meta = project.meta || {};
+    const state = (project.stages && project.stages[stage]) || {};
+    const out = [];
+
+    if (stage === "bronze") {
+      for (const r of (state.rows || [])) {
+        if (!r.source_name || !r.source_name.trim()) continue;
+        const colName = r.source_name.toLowerCase().replace(/-/g, "_");
+        out.push({ col: colName, defaultDesc: r.description || "" });
+      }
+      out.push({ col: "audit_created_ts_local",
+                 defaultDesc: "Auditoría — fecha/hora de carga (UTC-3, horario local Argentina)",
+                 isAudit: true });
+      return out;
+    }
+
+    if (stage === "gold") {
+      const keys = (state.rows || []).filter(r => r.is_key && r.target_name);
+      if (keys.length > 1) {
+        const skName = keys.map(k => k.target_name.replace(/_(id|cd|nu)$/i, "")).join("_") + "_id";
+        out.push({ col: skName,
+                   defaultDesc: `Clave subrogada — hash de ${keys.map(k => k.target_name).join(" + ")}`,
+                   isSurrogate: true });
+      }
+    }
+    for (const r of (state.rows || [])) {
+      if (!r.target_name || !r.target_name.trim()) continue;
+      out.push({ col: r.target_name, defaultDesc: r.description || "" });
+    }
+    out.push({ col: "audit_created_ts",
+               defaultDesc: `Auditoría — fecha/hora de carga en ${stage === "silver" ? "Silver" : "Gold"} (UTC-3, horario local Argentina)`,
+               isAudit: true });
+    out.push({ col: "audit_data_source_tx",
+               defaultDesc: "Auditoría — origen del dato",
+               isAudit: true });
+    return out;
+  }
+
+  // Comments huérfanos: keys en project.comments[stage].columns que ya no
+  // corresponden a ningún target listado.
+  function listOrphanComments(project, stage) {
+    const targets = new Set(listCommentTargets(project, stage).map(t => t.col));
+    const cols = (project.comments && project.comments[stage] && project.comments[stage].columns) || {};
+    return Object.keys(cols).filter(k => !targets.has(k));
+  }
+
+  function defaultTableComment(project, stage) {
+    const meta = project.meta || {};
+    const state = (project.stages && project.stages[stage]) || {};
+    const targetDesc = state.target && state.target.description;
+    if (targetDesc) return targetDesc;
+    if (stage === "bronze") {
+      return `Bronze — espejo fiel de ${NAME.bronzeTable(meta)}, inmutable, no consumible`;
+    }
+    if (stage === "silver") {
+      return `Silver — ${NAME.silverTable(meta)} tipado y deduplicado`;
+    }
+    return `Gold — ${NAME.goldTable(meta)} (${meta.gold_table_kind || "—"})`;
+  }
+
+  // ============================================================
   //  Linter — valida que target_name use sufijo del Anexo
   //           y que target_type matchee la regla del sufijo
   // ============================================================
   function lintRow(row, stage) {
     const issues = [];
-    if (stage === "bronze") return issues;       // bronze mantiene nombres origen
+
+    // Description: si la fila tiene contenido, debería tener description
+    // (impacta el COMMENT ON COLUMN de Redshift y la doc del catálogo)
+    const hasContent = (stage === "bronze")
+      ? (row.source_name && row.source_name.trim())
+      : (row.target_name && row.target_name.trim());
+    if (hasContent && (!row.description || !row.description.trim())) {
+      const colName = (stage === "bronze") ? row.source_name : row.target_name;
+      if (!String(colName).startsWith("audit_")) {
+        issues.push({
+          level: "warn",
+          kind: "no-description",
+          msg: `'${colName}' no tiene descripción (no se emitirá COMMENT ON COLUMN)`,
+        });
+      }
+    }
+
+    if (stage === "bronze") return issues;       // bronze mantiene nombres origen — no chequeo sufijos
     if (!row.target_name || !row.target_name.trim()) return issues;
     if (row.target_name.startsWith("audit_")) return issues; // campos auditoría
 
@@ -137,8 +237,11 @@
       if (!st || !st.rows) continue;
       for (const row of st.rows) {
         const issues = lintRow(row, stage);
+        const displayName = (stage === "bronze")
+          ? (row.source_name || row.target_name || "")
+          : (row.target_name || row.source_name || "");
         for (const issue of issues) {
-          out[stage].push({ row_id: row.id, target_name: row.target_name, ...issue });
+          out[stage].push({ row_id: row.id, target_name: displayName, ...issue });
         }
       }
     }
@@ -255,10 +358,11 @@
   // ============================================================
   //  Column builders — construyen el objeto column para YAML
   // ============================================================
-  function bronzeColumn(row) {
+  function bronzeColumn(row, project) {
     const name = (row.source_name || "").toLowerCase().replace(/-/g, "_");
     const col = { name };
-    if (row.description) col.description = row.description;
+    const desc = getColumnComment(project, "bronze", name, row.description || "");
+    if (desc) col.description = desc;
     if (row.target_type) col.data_type = row.target_type.toLowerCase();
     const tests = buildTests(row, "bronze");
     if (tests.length) col.tests = tests;
@@ -274,9 +378,10 @@
     return col;
   }
 
-  function modelColumn(row, stage) {
+  function modelColumn(row, stage, project) {
     const col = { name: row.target_name };
-    if (row.description) col.description = row.description;
+    const desc = getColumnComment(project, stage, row.target_name, row.description || "");
+    if (desc) col.description = desc;
     if (row.target_type) col.data_type = row.target_type.toLowerCase();
     const tests = buildTests(row, stage);
     if (tests.length) col.tests = tests;
@@ -298,23 +403,24 @@
     const state = project.stages.bronze || {};
     const cols = (state.rows || [])
       .filter(r => r.source_name && r.source_name.trim())
-      .map(bronzeColumn);
+      .map(r => bronzeColumn(r, project));
     cols.push({
       name: "audit_created_ts_local",
-      description: "Auditoría — fecha/hora de carga (UTC-3, horario local Argentina)",
+      description: getColumnComment(project, "bronze", "audit_created_ts_local",
+        "Auditoría — fecha/hora de carga (UTC-3, horario local Argentina)"),
       data_type: "timestamp without time zone",
     });
+    const tableDesc = getTableComment(project, "bronze",
+      (state.source && state.source.description) || defaultTableComment(project, "bronze"));
     const yaml = {
       version: 2,
       sources: [{
         name: NAME.bronzeSchema(meta),
         schema: NAME.bronzeSchema(meta),
-        description: (state.source && state.source.description) ||
-                     `Bronze — espejo fiel de ${NAME.bronzeTable(meta)}, inmutable, no consumible`,
+        description: tableDesc,
         tables: [{
           name: NAME.bronzeTable(meta),
-          description: (state.target && state.target.description) ||
-                       `Tabla raw de ${meta.logical_name || "—"} desde ${meta.sigla_aplicativa || "origen"}`,
+          description: tableDesc,
           columns: cols,
         }],
       }],
@@ -327,23 +433,24 @@
     const state = project.stages.silver || {};
     const cols = (state.rows || [])
       .filter(r => r.target_name && r.target_name.trim())
-      .map(r => modelColumn(r, "silver"));
+      .map(r => modelColumn(r, "silver", project));
     cols.push({
       name: "audit_created_ts",
-      description: "Auditoría — fecha/hora de carga en Silver (UTC-3, horario local Argentina)",
+      description: getColumnComment(project, "silver", "audit_created_ts",
+        "Auditoría — fecha/hora de carga en Silver (UTC-3, horario local Argentina)"),
       data_type: "timestamp without time zone",
     });
     cols.push({
       name: "audit_data_source_tx",
-      description: "Auditoría — origen del dato",
+      description: getColumnComment(project, "silver", "audit_data_source_tx",
+        "Auditoría — origen del dato"),
       data_type: "varchar(100)",
     });
     const yaml = {
       version: 2,
       models: [{
         name: NAME.silverTable(meta),
-        description: (state.target && state.target.description) ||
-                     `Silver — ${NAME.silverTable(meta)} tipado y deduplicado`,
+        description: getTableComment(project, "silver", defaultTableComment(project, "silver")),
         config: {
           schema: `inter_${meta.logical_name || ""}`,
           materialized: meta.silver_materialization || "view",
@@ -360,7 +467,7 @@
     const state = project.stages.gold || {};
     const cols = (state.rows || [])
       .filter(r => r.target_name && r.target_name.trim())
-      .map(r => modelColumn(r, "gold"));
+      .map(r => modelColumn(r, "gold", project));
 
     // Surrogate key cuando hay PK compuesta (más de un is_key)
     const keys = (state.rows || []).filter(r => r.is_key && r.target_name);
@@ -368,7 +475,8 @@
       const skName = keys.map(k => k.target_name.replace(/_(id|cd|nu)$/i, "")).join("_") + "_id";
       cols.unshift({
         name: skName,
-        description: `Clave subrogada (hash de ${keys.map(k => k.target_name).join(" + ")})`,
+        description: getColumnComment(project, "gold", skName,
+          `Clave subrogada (hash de ${keys.map(k => k.target_name).join(" + ")})`),
         data_type: "varchar(100)",
         tests: ["not_null", "unique"],
       });
@@ -376,12 +484,14 @@
 
     cols.push({
       name: "audit_created_ts",
-      description: "Auditoría — fecha/hora de carga en Gold (UTC-3, horario local Argentina)",
+      description: getColumnComment(project, "gold", "audit_created_ts",
+        "Auditoría — fecha/hora de carga en Gold (UTC-3, horario local Argentina)"),
       data_type: "timestamp without time zone",
     });
     cols.push({
       name: "audit_data_source_tx",
-      description: "Auditoría — origen del dato",
+      description: getColumnComment(project, "gold", "audit_data_source_tx",
+        "Auditoría — origen del dato"),
       data_type: "varchar(100)",
     });
 
@@ -398,8 +508,7 @@
       version: 2,
       models: [{
         name: NAME.goldTable(meta),
-        description: (state.target && state.target.description) ||
-                     `Gold — ${NAME.goldTable(meta)} (${meta.gold_table_kind || "—"})`,
+        description: getTableComment(project, "gold", defaultTableComment(project, "gold")),
         config,
         columns: cols,
       }],
@@ -581,20 +690,23 @@
     const fq = `${NAME.bronzeSchema(meta)}.${NAME.bronzeTable(meta)}`;
     const lines = [buildCommentsHeader("Bronze", fq)];
 
-    const tableDesc = (state.target && state.target.description) ||
-                      (state.source && state.source.description) ||
-                      `Bronze — espejo fiel de ${NAME.bronzeTable(meta)}, inmutable, no consumible`;
+    const tableDesc = getTableComment(project, "bronze",
+      (state.target && state.target.description) ||
+      (state.source && state.source.description) ||
+      defaultTableComment(project, "bronze"));
     lines.push(commentOnTable(fq, tableDesc));
     lines.push("");
 
     for (const r of (state.rows || [])) {
       if (!r.source_name || !r.source_name.trim()) continue;
-      if (!r.description || !r.description.trim()) continue;
       const colName = r.source_name.toLowerCase().replace(/-/g, "_");
-      lines.push(commentOnColumn(fq, colName, r.description.trim()));
+      const desc = getColumnComment(project, "bronze", colName, r.description || "");
+      if (!desc) continue;
+      lines.push(commentOnColumn(fq, colName, desc));
     }
-    lines.push(commentOnColumn(fq, "audit_created_ts_local",
-      "Auditoría — fecha/hora de carga (UTC-3, horario local Argentina)"));
+    const auditDesc = getColumnComment(project, "bronze", "audit_created_ts_local",
+      "Auditoría — fecha/hora de carga (UTC-3, horario local Argentina)");
+    if (auditDesc) lines.push(commentOnColumn(fq, "audit_created_ts_local", auditDesc));
     return lines.join("\n") + "\n";
   }
 
@@ -604,20 +716,23 @@
     const fq = `${NAME.silverSchema(meta)}.${NAME.silverTable(meta)}`;
     const lines = [buildCommentsHeader("Silver", fq)];
 
-    const tableDesc = (state.target && state.target.description) ||
-                      `Silver — ${NAME.silverTable(meta)} tipado y deduplicado`;
+    const tableDesc = getTableComment(project, "silver",
+      (state.target && state.target.description) || defaultTableComment(project, "silver"));
     lines.push(commentOnTable(fq, tableDesc));
     lines.push("");
 
     for (const r of (state.rows || [])) {
       if (!r.target_name || !r.target_name.trim()) continue;
-      if (!r.description || !r.description.trim()) continue;
-      lines.push(commentOnColumn(fq, r.target_name, r.description.trim()));
+      const desc = getColumnComment(project, "silver", r.target_name, r.description || "");
+      if (!desc) continue;
+      lines.push(commentOnColumn(fq, r.target_name, desc));
     }
-    lines.push(commentOnColumn(fq, "audit_created_ts",
-      "Auditoría — fecha/hora de carga en Silver (UTC-3, horario local Argentina)"));
-    lines.push(commentOnColumn(fq, "audit_data_source_tx",
-      "Auditoría — origen del dato"));
+    const tsDesc = getColumnComment(project, "silver", "audit_created_ts",
+      "Auditoría — fecha/hora de carga en Silver (UTC-3, horario local Argentina)");
+    if (tsDesc) lines.push(commentOnColumn(fq, "audit_created_ts", tsDesc));
+    const srcDesc = getColumnComment(project, "silver", "audit_data_source_tx",
+      "Auditoría — origen del dato");
+    if (srcDesc) lines.push(commentOnColumn(fq, "audit_data_source_tx", srcDesc));
     return lines.join("\n") + "\n";
   }
 
@@ -627,8 +742,8 @@
     const fq = `${NAME.goldSchema(meta)}.${NAME.goldTable(meta)}`;
     const lines = [buildCommentsHeader("Gold", fq)];
 
-    const tableDesc = (state.target && state.target.description) ||
-                      `Gold — ${NAME.goldTable(meta)} (${meta.gold_table_kind || "—"})`;
+    const tableDesc = getTableComment(project, "gold",
+      (state.target && state.target.description) || defaultTableComment(project, "gold"));
     lines.push(commentOnTable(fq, tableDesc));
     lines.push("");
 
@@ -636,19 +751,23 @@
     const keys = (state.rows || []).filter(r => r.is_key && r.target_name);
     if (keys.length > 1) {
       const skName = keys.map(k => k.target_name.replace(/_(id|cd|nu)$/i, "")).join("_") + "_id";
-      lines.push(commentOnColumn(fq, skName,
-        `Clave subrogada — hash de ${keys.map(k => k.target_name).join(" + ")}`));
+      const skDesc = getColumnComment(project, "gold", skName,
+        `Clave subrogada — hash de ${keys.map(k => k.target_name).join(" + ")}`);
+      if (skDesc) lines.push(commentOnColumn(fq, skName, skDesc));
     }
 
     for (const r of (state.rows || [])) {
       if (!r.target_name || !r.target_name.trim()) continue;
-      if (!r.description || !r.description.trim()) continue;
-      lines.push(commentOnColumn(fq, r.target_name, r.description.trim()));
+      const desc = getColumnComment(project, "gold", r.target_name, r.description || "");
+      if (!desc) continue;
+      lines.push(commentOnColumn(fq, r.target_name, desc));
     }
-    lines.push(commentOnColumn(fq, "audit_created_ts",
-      "Auditoría — fecha/hora de carga en Gold (UTC-3, horario local Argentina)"));
-    lines.push(commentOnColumn(fq, "audit_data_source_tx",
-      "Auditoría — origen del dato"));
+    const tsDesc = getColumnComment(project, "gold", "audit_created_ts",
+      "Auditoría — fecha/hora de carga en Gold (UTC-3, horario local Argentina)");
+    if (tsDesc) lines.push(commentOnColumn(fq, "audit_created_ts", tsDesc));
+    const srcDesc = getColumnComment(project, "gold", "audit_data_source_tx",
+      "Auditoría — origen del dato");
+    if (srcDesc) lines.push(commentOnColumn(fq, "audit_data_source_tx", srcDesc));
     return lines.join("\n") + "\n";
   }
 
@@ -845,6 +964,12 @@
     lintRow,
     lintProject,
     lintMeta,
+    defaultComments,
+    getTableComment,
+    getColumnComment,
+    listCommentTargets,
+    listOrphanComments,
+    defaultTableComment,
     buildBronzeYaml,
     buildSilverYaml,
     buildGoldYaml,

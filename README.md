@@ -18,6 +18,13 @@ Genera artefactos dbt (`_sources.yml`, `_models.yml`, `.sql`) que respetan la _N
 - **Export ZIP completo** — botón **📦 ZIP dbt** en topbar. Descarga la estructura `models/{bronze,silver,gold}/` lista para mergear contra un proyecto dbt existente, más README contextual y backup del state del modeler.
 - **Auto-inyección de campos de auditoría** — `audit_created_ts_local` (Bronze), `audit_created_ts` + `audit_data_source_tx` (Silver/Gold). Los timestamps usan `convert_timezone('America/Argentina/Buenos_Aires', getdate())` según el documento.
 - **Surrogate key automática en Gold** — cuando hay PK compuesta (más de un `is_key`), se genera la columna `<concept1>_<concept2>_id` con `md5(coalesce(...) || '-' || coalesce(...))::varchar(100)`.
+- **Editor de COMMENTs** — modal accesible desde **💬 Comments** en topbar. Por capa (Bronze/Silver/Gold):
+  - Override del COMMENT de tabla
+  - Override del COMMENT de cada columna del modelado, con la `description` del modelado mostrada como hint
+  - Override de COMMENTs de **audit fields** y **surrogate key** (que no están en el modelado pero sí aparecen en la base)
+  - Sección de **comments huérfanos** cuando renombrás/eliminás una columna del modelado pero el override quedó (con botón para borrar)
+  - Los overrides también se sincronizan al `description` del YAML, así `persist_docs` aplica la versión editada
+  - Escape SQL automático de comillas simples
 - **COMMENTs de Redshift** — los descriptions del modelado se persisten en el catálogo de Redshift por dos vías:
   - **Silver/Gold**: vía `persist_docs={'relation': True, 'columns': True}` en el `{{ config() }}` de cada modelo. Cada `dbt run` reemite los COMMENTs. Sin acción manual.
   - **Bronze**: como source no se ejecuta vía dbt, el ZIP incluye `models/bronze/_comments.sql` con los `COMMENT ON TABLE`/`COMMENT ON COLUMN` ejecutables directo en Redshift.
